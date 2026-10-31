@@ -1,0 +1,86 @@
+# WITNESS — Production docker-compose.yml (spec §70).
+#
+# Brings up the full stack: backend (FastAPI + SQLite), frontend (Next.js),
+# and a Caddy reverse proxy that exposes them on port 80.
+#
+# Works on Linux, macOS (Docker Desktop), and Windows (Docker Desktop or WSL2).
+#
+# Usage:
+#   cp .env.example .env
+#   # set WITNESS_API_TOKENS in .env (production refuses to start without auth)
+#   docker compose up --build
+#
+# Then visit:
+#   - http://localhost                  → console (via Caddy)
+#   - http://localhost/api/witness/...  → backend (via Caddy, prefix stripped)
+#   - http://localhost:8000       → backend direct (for debugging)
+#   - http://localhost:8000/docs   → OpenAPI / Swagger UI
+#
+# To reset the DB:
+#   docker compose down -v
+#   docker volume rm witness_witness-data
+#   docker compose up --build
+
+services:
+  witness-backend:
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend.Dockerfile
+    container_name: witness-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - WITNESS_ENVIRONMENT=production
+      - WITNESS_HOST=0.0.0.0
+      - WITNESS_PORT=8000
+      - WITNESS_DATABASE_URL=sqlite+aiosqlite:////app/data/witness.db
+      - WITNESS_MODEL_PROVIDER=mock
+      - WITNESS_PRIVACY_MODE=LOCAL_ONLY
+      - WITNESS_REQUIRE_APPROVAL_HIGH_RISK=true
+      - WITNESS_OT_REQUIRES_DUAL_APPROVAL=true
+      - WITNESS_AUTOLOAD_ATTACK=true
+      - WITNESS_KNOWLEDGE_DIR=/app/data/knowledge
+      - WITNESS_PCAP_DIR=/app/data/pcaps
+      - WITNESS_AUTH_MODE=${WITNESS_AUTH_MODE:-token}
+      - WITNESS_API_TOKENS=${WITNESS_API_TOKENS:?Set WITNESS_API_TOKENS in .env (token:user:role,...)}
+    volumes:
+      - witness-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  witness-frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    container_name: witness-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - WITNESS_BACKEND_URL=http://witness-backend:8000
+    depends_on:
+      witness-backend:
+        condition: service_healthy
+
+  # Caddy reverse proxy — exposes everything on port 80.
+  # The Caddyfile routes /api/* and /openapi.json to the backend, everything
+  # else to the frontend.
+  witness-gateway:
+    image: caddy:2
+    container_name: witness-gateway
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./docker/Caddyfile.prod:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - witness-backend
+      - witness-frontend
+
+volumes:
+  witness-data:

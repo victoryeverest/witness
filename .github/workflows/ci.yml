@@ -1,0 +1,132 @@
+name: WITNESS CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test-backend:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install system deps (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libyara-dev libpcap-dev
+      - name: Install system deps (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install yara libpcap
+      - name: Install Python deps
+        # Single source of truth. The previous inline package list lacked
+        # greenlet (sqlalchemy[asyncio]), so the suite could not even import.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt ruff
+      - name: Lint (pyflakes rules via ruff)
+        working-directory: backend
+        run: ruff check witness tests
+      - name: Run tests with coverage
+        working-directory: backend
+        # tests/conftest.py points the app at a throwaway database.
+        run: python -m pytest tests/ --tb=short --cov=witness --cov-report=term-missing
+
+  test-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.21
+      - name: Install frontend deps
+        run: bun install --frozen-lockfile
+      - name: Type-check
+        run: bunx tsc --noEmit
+      - name: Lint frontend
+        run: bun run lint
+      - name: Build frontend
+        run: bun run build
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pip-audit
+        run: pip install pip-audit
+      - name: Scan Python dependencies for known CVEs
+        # Audits the real requirements file and fails the job on findings.
+        run: pip-audit -r backend/requirements.txt
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [test-backend, test-frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./docker/backend.Dockerfile
+          push: false
+          tags: witness-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/frontend.Dockerfile
+          push: false
+          tags: witness-frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  e2e-smoke:
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    env:
+      # Throwaway credentials for the ephemeral CI stack only.
+      WITNESS_API_TOKENS: ci-admin-token-0123456789abcdef:ci-admin:admin
+      AUTH: 'Authorization: Bearer ci-admin-token-0123456789abcdef'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Start the stack
+        run: docker compose up -d --build --wait
+      - name: Smoke test — /health (public) and auth enforced
+        run: |
+          curl -fsS http://localhost/health | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='ok' and d['auth_mode']=='token'"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost/api/witness/investigations)" = "401"
+      - name: Smoke test — flagship demo through the gateway
+        run: |
+          curl -fsS -X POST http://localhost/api/witness/demo/flagship \
+            -H "$AUTH" -H 'Content-Type: application/json' \
+            -d '{"max_iterations": 3}' \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='completed'; assert d['metrics']['detection_correct']==1.0; assert d['metrics']['hallucination_rate']==0.0"
+      - name: Smoke test — benchmark
+        run: |
+          curl -fsS -X POST http://localhost/api/witness/benchmarks/run \
+            -H "$AUTH" -H 'Content-Type: application/json' \
+            -d '{}' | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['runs']==4"
+      - name: Smoke test — console is served
+        run: curl -fsS http://localhost/ | grep -qi witness
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

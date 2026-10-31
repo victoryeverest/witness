@@ -1,0 +1,33 @@
+# Production Caddyfile for the docker-compose stack.
+#
+# The console calls the backend under /api/witness/* (see src/lib/witness-api.ts).
+# Caddy strips that prefix and proxies to FastAPI, so new backend routes need
+# no gateway change. (The previous hand-maintained list of backend paths had
+# already drifted: /pcap, /knowledge, /detection, /rules, /query, /baselines
+# and /auth were unreachable through the gateway.)
+#
+# For TLS, replace ":80" with your hostname; Caddy obtains certificates.
+
+:80 {
+	encode gzip
+
+	handle_path /api/witness/* {
+		reverse_proxy witness-backend:8000
+	}
+
+	# Health and API docs, for operators.
+	@backend_direct path /health /docs /redoc /openapi.json
+	handle @backend_direct {
+		reverse_proxy witness-backend:8000
+	}
+
+	handle {
+		reverse_proxy witness-frontend:3000
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+	}
+}
